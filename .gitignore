@@ -25,7 +25,7 @@ wheels/
 .idea/
 
 .ipynb_checkpoints
-
+.gitignore
 
 
 wandb/
