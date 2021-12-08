@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import albumentations as A
 from albumentations.pytorch.transforms import ToTensorV2
+from fastprogress.fastprogress import master_bar, progress_bar
 
 from PIL import Image
 
@@ -22,7 +23,6 @@ from collections import defaultdict
 from pathlib import Path
 
 
-from config import CFG
 
 scale = tuple((0.08, 1.0))  # default imagenet scale range
 ratio = tuple((3./4., 4./3.)) # default imagenet ratio range
@@ -41,7 +41,7 @@ _str_to_pil_interpolation = {b: a for a, b in _pil_interpolation_to_str.items()}
 def str_to_pil_interp(mode_str):
     return _str_to_pil_interpolation[mode_str]
 aa_params = dict(
-            translate_const=int(CFG.img_size[0] * 0.45),
+            translate_const=int(256 * 0.45),
             img_mean=tuple([min(255, round(255 * x)) for x in mean]),
             )
 #aa_params['interpolation'] = str_to_pil_interp(interpolation)
@@ -52,15 +52,27 @@ interpolation = 'random'
 from rand_augment import rand_augment_transform
 from rrc import RandomResizedCropAndInterpolation, ToNumpy
 from torchvision import transforms
+
+from skimage.restoration import denoise_tv_chambolle
+
+from albumentations.core.transforms_interface import ImageOnlyTransform, DualTransform
+class TV_aug(DualTransform):
+    def apply(self, img, **params):
+        return denoise_tv_chambolle(img, weight=0.1)
+    
+## Augmentations used
+# A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+# A.RandomGamma(gamma_limit=(80, 120))
 tfms = A.Compose([
-    A.CenterCrop(256,256),
-    A.PadIfNeeded(256,256)])
+    TV_aug(p=0.5) 
+    ])
 
 import ctypes
 import multiprocessing as mp
 
 class CC359_Dataset(Dataset):
-    def __init__(self, df, root_dir, voxel_spacing, transforms=None, mode="train", cache=True):
+    def __init__(self, CFG, df, root_dir, voxel_spacing, transforms=None, mode="train", cache=True, cached_x=None,cached_y=None):
+        self.CFG = CFG
         self.df = df
         self.root_dir = root_dir
         self.voxel_spacing = voxel_spacing
@@ -71,51 +83,24 @@ class CC359_Dataset(Dataset):
         self.img_paths = df['MRI_scaled_voxel_spacing']
         self.segm_paths = df['brain_mask_scaled_voxel_spacing']
         self.sample_voxel_spacing = np.array([df['x'],df['y'],df['z']])
+
+        
+        self.T = T.Compose([T.CenterSpatialCropd(keys=("image","seg"),roi_size=self.CFG.img_size),
+                            T.SpatialPadd(keys=("image","seg"),spatial_size=self.CFG.img_size)])
         
         self.tfms2 = RandomResizedCropAndInterpolation(CFG.img_size, scale=scale, ratio=ratio, interpolation=interpolation)
-        self.tfms3 = rand_augment_transform(auto_augment, aa_params)
-        
-        self.T = T.Compose([T.CenterSpatialCropd(keys=("image","seg"),roi_size=CFG.img_size),
-                            T.SpatialPadd(keys=("image","seg"),spatial_size=CFG.img_size)])
         
         if self.cache:
-            if mode=="train": n_samples = 12000
-            elif mode=="val": n_samples = 1000
-            shared_array_base = mp.Array(ctypes.c_float, n_samples*256*256)
-            shared_array = np.ctypeslib.as_array(shared_array_base.get_obj())
-            self.shared_array = shared_array.reshape(n_samples,256,256)
-            print(self.shared_array.shape)
-            
-            shared_array_base2 = mp.Array(ctypes.c_float, n_samples*256*256)
-            shared_array2 = np.ctypeslib.as_array(shared_array_base2.get_obj())
-            self.shared_array2 = shared_array2.reshape(n_samples, 256,256)            
-            
-            self.imgs, self.segms = [],[]
-            curr_idx = 0
-            for idx in progress_bar(range(len(self.df)),len(self.df)):
-                img_fn = self.img_paths[idx]
-                sgm_fn = self.segm_paths[idx]
-                img = nib.load(f"{self.root_dir}/{img_fn}").get_fdata()
-                segm = nib.load(f"{self.root_dir}/{sgm_fn}").get_fdata()  
-                #img, segm = self.scale_voxel_spacing(idx, img, segm)
-                img = self.scale_mri(img)
+            self.shared_array_x = cached_x
+            self.shared_array_y = cached_y     
 
-                
-                tfmed = self.T({'image':img, 'seg':segm})       
-                img = tfmed['image']
-                segm = tfmed['seg']
-
-                c = img.shape[0]
-                self.shared_array[curr_idx:curr_idx+c] = img
-                self.shared_array2[curr_idx:curr_idx+c] = segm
-                curr_idx += c
-                #self.imgs.append(img); self.segms.append(segm)
-            #self.imgs = np.concatenate(self.imgs)
-            #self.segms = np.concatenate(self.segms)
-            self.curr_idx = curr_idx
+            self.curr_idx = self.shared_array_x.shape[0]
         
     def __len__(self):
-        return self.curr_idx
+        if self.cache==True:
+            return self.curr_idx
+        else:
+            return len(self.id)
 
     def scale_voxel_spacing(self, idx, img, segm):
         sample_vxsp = self.sample_voxel_spacing[:,idx]
@@ -133,8 +118,8 @@ class CC359_Dataset(Dataset):
     
     def __getitem__(self, idx):
         if self.cache:
-            img = self.shared_array[idx]
-            segm = self.shared_array2[idx]
+            img  = self.shared_array_x[idx]
+            segm = self.shared_array_y[idx]
             #img = self.imgs[idx]
             #segm = self.segms[idx]
         else:
@@ -146,22 +131,28 @@ class CC359_Dataset(Dataset):
             #img, segm = self.scale_voxel_spacing(idx, img, segm)
             img = self.scale_mri(img)
             
-            slc = np.random.randint(img.shape[0] // 1)*1
-            img,segm = img[slc,:,:],segm[slc,:,:]
+            img = np.transpose(img,(2,0,1))
+            segm = np.transpose(segm,(2,0,1))
+                
+            tfmed = self.T({'image':img, 'seg':segm})       
+            img = tfmed['image']
+            segm = tfmed['seg']
+            
+            
 
         
         if self.transform:
-            #monai tfms
-            #tfmed = self.T({'image':img, 'seg':segm})       
-            #img = tfmed['image']; 
-            #segm = tfmed['seg']
-
-            img, segm = Image.fromarray(img*255).convert('L'),Image.fromarray(segm*255).convert('L')
-            img, segm = self.tfms2(img,segm)
-            img, segm = self.tfms3(img,segm)
-            img, segm = (ToNumpy()(img)/255.).squeeze(), np.array(segm)/255.
+            out = self.transform(image=img)
+            img = out["image"]
             
-        if self.mode in ["train", "val"]:
-            return torch.from_numpy(img).to(dtype=torch.float32).unsqueeze(0), torch.from_numpy(segm).to(dtype=torch.long)
-        elif self.mode=="test":
-            return torch.as_tensor(img, dtype=torch.float), torch.as_tensor(segm, dtype=torch.float), self.id[idx]
+            #img, segm = Image.fromarray(img*255).convert('L'),Image.fromarray(segm*255).convert('L')
+            #img, segm = self.tfms2(img,segm)
+            #img, segm = (ToNumpy()(img)/255.).squeeze(), np.array(segm)/255.
+            
+        if self.mode=="train":
+            return torch.from_numpy(img).to(dtype=torch.float32).unsqueeze(0), torch.from_numpy(segm).to(dtype=torch.float)
+        elif self.mode in ["val","test"]:
+            return  torch.from_numpy(img).to(dtype=torch.float32), torch.from_numpy(segm).to(dtype=torch.float), self.id[idx]
+
+        
+        

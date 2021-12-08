@@ -141,10 +141,10 @@ class UNet2D(nn.Module):
 
         return x
 
-    def save_policy(self, folder_name):
+    def save_policy(self, folder_name, path):
 
         we_are_here = os.path.abspath('.')
-        folder_to_store_in = os.path.join(we_are_here, folder_name)
+        folder_to_store_in = os.path.join(path, folder_name)
         if not os.path.exists(folder_to_store_in):
             os.mkdir(folder_to_store_in)
 

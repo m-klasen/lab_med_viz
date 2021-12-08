@@ -382,7 +382,7 @@ _RAND_CHOICE_WEIGHTS_0 = {
 
 class AugmentOp:
 
-    def __init__(self, name, prob=0.5, magnitude=10, hparams=None):
+    def __init__(self, name, prob=1, magnitude=10, hparams=None):
         hparams = hparams or _HPARAMS_DEFAULT
         self.name = name
         self.aug_fn = NAME_TO_OP[name]
