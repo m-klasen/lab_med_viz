@@ -93,14 +93,13 @@ class Trainer:
             mb.write([f'{l:.4f}' if isinstance(l, float) else str(l) for l in log], table=True)
                 
             # if True:
-            #if self.best_valid_score < valid_auc:
-            if self.CFG.early_stopping:
-                if self.best_valid_score > valid_loss:
-                    save_p = f"{save_path}mode_{self.mode}_best_epoch_model.pth"
-                    self.save_model(n_epoch, save_p, valid_loss)
-                    self.best_valid_score = valid_loss
+            #if self.best_valid_score < valid_auc: 
+            if self.best_valid_score > valid_loss:
+                save_p = f"{save_path}mode_{self.mode}_best_epoch_model.pth"
+                self.save_model(n_epoch, save_p, valid_loss)
+                self.best_valid_score = valid_loss
 
-            if (n_epoch+1)%10==0:
+            if n_epoch%10==0:
                 save_p = f"{save_path}e_{n_epoch}.pth"
                 self.save_model(n_epoch, save_p, valid_loss)
             
@@ -109,11 +108,10 @@ class Trainer:
         sum_loss = 0
         all_dice = []
         for step, (x,targets) in progress_bar(enumerate(train_loader, 1),len(train_loader), parent=mb):
-            #targets = targets.unsqueeze(1).to(torch.int64)
             if self.fp16:
                 with autocast():
                     self.optimizer.zero_grad()
-                    logits = self.model(x).squeeze()
+                    logits = self.model(x)
                     loss = self.criterion(logits, targets)
                 self.scaler.scale(loss).backward()
 
@@ -128,8 +126,8 @@ class Trainer:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
-                if self.CFG.scheduler==torch.optim.lr_scheduler.OneCycleLR:
-                    self.scheduler.step() 
+                    if self.CFG.scheduler==torch.optim.lr_scheduler.OneCycleLR:
+                        self.scheduler.step() 
             else:
                 self.optimizer.zero_grad()
                 logits = self.model(x).squeeze()
@@ -143,8 +141,8 @@ class Trainer:
                                                        error_if_nonfinite=False)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                if self.CFG.scheduler==torch.optim.lr_scheduler.OneCycleLR:
-                    self.scheduler.step()  
+                    if self.CFG.scheduler==torch.optim.lr_scheduler.OneCycleLR:
+                        self.scheduler.step()  
             
             
             sum_loss += loss.detach().item()
@@ -158,12 +156,12 @@ class Trainer:
             mb.child.comment = 'train_loss: {:.4f}, LR: {:.2e}'.format(sum_loss/step, self.optimizer.param_groups[0]['lr'])
         
             ## Debugging
-            # self.writer.add_images("X", x, self.step)
-            # self.writer.add_images("Y", targets.unsqueeze(1), self.step)
-            # self.writer.add_images("Preds", outputs.unsqueeze(1), self.step)
-            # for name, weight in self.model.named_parameters():
-            #     self.writer.add_histogram(name,weight, self.step)
-            #     self.writer.add_histogram(f'{name}.grad',weight.grad, self.step)
+            #self.writer.add_images("X", x, self.step)
+            #self.writer.add_images("Y", targets.unsqueeze(1), self.step)
+            #self.writer.add_images("Preds", outputs.unsqueeze(1), self.step)
+            #for name, weight in self.model.named_parameters():
+                #self.writer.add_histogram(name,weight, n_epoch)
+                #self.writer.add_histogram(f'{name}.grad',weight.grad, self.step)
             
             
             
@@ -182,26 +180,22 @@ class Trainer:
         all_dice = []
         all_sdice = []
         for step,(x,y,_id) in progress_bar(enumerate(valid_loader, 1), len(valid_loader), parent=mb):
-            y = y.squeeze(0)#.to(torch.int64)
             with torch.no_grad():
-                x = x[0].to(self.device); _id=_id[0]
+                x = x.to(self.device); _id=_id[0]
                 y = y.to(self.device)
-                c,h,w = x.shape
-                outputs = []
-                for idx in range(0,c,bs):
-                    out = self.model(x[idx:min(idx+bs,c)].unsqueeze(1)).squeeze()
-                    if len(out.shape)==2: out = out[None,:,:]
-                    outputs.append(out)
-                logits = torch.cat(outputs)#.transpose(0,1)
-                loss = self.criterion(logits, y)
+                bs,c,s,h,w = x.shape
+                out = self.model(x)
+                loss = self.criterion(out, y)
                 
-                outputs = torch.sigmoid(logits.detach())
+                outputs = torch.sigmoid(out.detach())
                 preds = (outputs > .5).cpu().numpy()
                 targs = (y > .5).cpu().numpy()
                 sum_loss += loss.detach().item()
 
             d_score = dice_score(targs, preds)
-            sd_score = sdice(targs, preds, self.CFG.voxel_spacing,self.CFG.sdice_tolerance)
+            sd_score = sdice(targs.squeeze(0).squeeze(0), 
+                             preds.squeeze(0).squeeze(0), 
+                             self.CFG.voxel_spacing,self.CFG.sdice_tolerance)
             
             all_dice.append(d_score);all_sdice.append(sd_score)
 
@@ -218,21 +212,21 @@ class Trainer:
 
         results = defaultdict(dict)
         for step,(x,y,_id) in progress_bar(enumerate(test_loader, 1), len(test_loader)):
-            y = y.squeeze(0)#.to(torch.int64)
             with torch.no_grad():
-                x = x[0].to(self.device); _id=_id[0]
-                c,h,w = x.shape
-                outputs = []
-                for idx in range(0,c,bs):
-                    out = self.model(x[idx:min(idx+bs,c)].unsqueeze(1))
-                    out = out.squeeze().cpu().detach().numpy()
-                    if len(out.shape)==2: out = out[None,:,:]
-                    outputs.append(out)
-                outputs = np.concatenate(outputs)#.transpose(1,0,2,3)
-                outputs = (outputs > .5).squeeze()
+                x = x.to(self.device); _id=_id[0]
+                y = y.to(self.device)
+                bs,c,s,h,w = x.shape
+                out = self.model(x)
+                
+                outputs = torch.sigmoid(out.detach())
+                preds = (outputs > .5).cpu().numpy()
+                outputs = (outputs > .5)
+                
                 y = (y > .5).numpy().squeeze()
 
-            results['sdice_score'][_id] = sdice(y, outputs, self.CFG.voxel_spacing,self.CFG.sdice_tolerance)
+            results['sdice_score'][_id] = sdice(y.squeeze(0).squeeze(0), 
+                                                outputs.squeeze(0).squeeze(0), 
+                                                self.CFG.voxel_spacing,self.CFG.sdice_tolerance)
             results['dice_score'][_id]  = dice_score(y, outputs)
 
         with open(os.path.join(result_path, 'sdice_score' + '.json'), 'w') as f:

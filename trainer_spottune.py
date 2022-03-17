@@ -119,21 +119,23 @@ class SpotTuneTrainer:
             
             train_loss, train_dice, train_sdice = self.train_epoch(train_loader, mb, n_epoch)
             valid_loss, valid_dice, valid_sdice = self.valid_epoch(valid_loader, mb, n_epoch)
-            self.scheduler_main.step()  
-            self.scheduler_policy.step()  
+            if self.CFG.scheduler!=torch.optim.lr_scheduler.OneCycleLR:
+                self.scheduler_main.step()  
+                self.scheduler_policy.step()  
             log = [n_epoch,train_loss, train_dice, train_sdice, 
                    valid_loss, valid_dice, valid_sdice, 
                    self.optimizer_main.param_groups[0]["lr"]]
             mb.write([f'{l:.4f}' if isinstance(l, float) else str(l) for l in log], table=True)
                 
             # if True:
-            #if self.best_valid_score < valid_auc: 
-            if self.best_valid_score > valid_loss:
-                save_p = f"{save_path}mode_{self.mode}_best_epoch_model.pth"
-                self.save_model(n_epoch, save_p, valid_loss)
-                self.best_valid_score = valid_loss
+            #if self.best_valid_score < valid_auc:
+            if self.CFG.early_stopping:
+                if self.best_valid_score > valid_loss:
+                    save_p = f"{save_path}mode_{self.mode}_best_epoch_model.pth"
+                    self.save_model(n_epoch, save_p, valid_loss)
+                    self.best_valid_score = valid_loss
 
-            if n_epoch%10==0:
+            if (n_epoch+1)%10==0:
                 save_p = f"{save_path}e_{n_epoch}.pth"
                 self.save_model(n_epoch, save_p, valid_loss)
         self.model.save_policy('policy_training_record', self.CFG.results_dir+"/mode_"+str(self.mode))
@@ -151,33 +153,55 @@ class SpotTuneTrainer:
             x = x.to(self.device)
             targets = y.to(self.device)
             
-            with autocast():
+
+
+            if self.fp16:
+                with autocast():
+                    self.optimizer_main.zero_grad()
+                    self.optimizer_policy.zero_grad()
+
+                    probs = self.model_policy(x)  # [32, 16]
+                    action = gumbel_softmax(probs.view(probs.size(0), -1, 2), temperature=self.temperature)  # [32, 8, 2]
+                    policy = action[:, :, 1]  # [32, 8]
+                    outputs = self.model(x,policy).squeeze()
+
+                    loss = self.criterion(outputs, targets) + reg_policy(policy=policy, k=self.k_reg, mode=self.reg_mode)
+                self.scaler.scale(loss).backward()
+                if (step + 1) % self.CFG.accumulation_steps == 0:
+                    if self.max_norm:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+                        torch.nn.utils.clip_grad_norm_(self.model_policy.parameters(), self.max_norm)            
+                
+                    self.scaler.step(self.optimizer_main)
+                    self.scaler.step(self.optimizer_policy)
+                    self.scaler.update()
+                if self.CFG.scheduler==torch.optim.lr_scheduler.OneCycleLR:
+                    self.scheduler_main.step()  
+                    self.scheduler_policy.step() 
+            else:
                 self.optimizer_main.zero_grad()
                 self.optimizer_policy.zero_grad()
 
                 probs = self.model_policy(x)  # [32, 16]
                 action = gumbel_softmax(probs.view(probs.size(0), -1, 2), temperature=self.temperature)  # [32, 8, 2]
                 policy = action[:, :, 1]  # [32, 8]
-                
                 outputs = self.model(x,policy).squeeze()
-                
-                
-            loss = self.criterion(outputs, targets) + reg_policy(policy=policy, k=self.k_reg, mode=self.reg_mode)
-
-            if self.fp16:
-                self.scaler.scale(loss).backward()
-            else:
+                loss = self.criterion(outputs, targets) + reg_policy(policy=policy, k=self.k_reg, mode=self.reg_mode)
                 loss.backward()
+                if (step + 1) % self.CFG.accumulation_steps == 0:
+                    if self.max_norm:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+                        torch.nn.utils.clip_grad_norm_(self.model_policy.parameters(), self.max_norm)            
+                
+                    self.optimizer_main.step()
+                    self.optimizer_policy.step()
+                if self.CFG.scheduler==torch.optim.lr_scheduler.OneCycleLR:
+                    self.scheduler_main.step()  
+                    self.scheduler_policy.step() 
 
             sum_loss += loss.detach().item()
             
-            if self.clip_grads:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(self.model_policy.parameters(), 0.25)            
-            if (step + 1) % self.CFG.accumulation_steps == 0:
-                self.scaler.step(self.optimizer_main)
-                self.scaler.step(self.optimizer_policy)
-                self.scaler.update()
+            
 
             outputs = torch.sigmoid(outputs)
             outs = (outputs > .5).cpu().numpy()
@@ -260,7 +284,7 @@ class SpotTuneTrainer:
                                                                               temperature=self.temperature)
                     policy = action[:, :, 1]
                     out = self.model(inp,policy)
-                    out = out.squeeze().cpu().detach().numpy()
+                    out = out.squeeze().sigmoid().cpu().detach().numpy()
                     if len(out.shape)==2: out = out[None,:,:]
                     outputs.append(out)
                 outputs = np.concatenate(outputs)

@@ -5,7 +5,7 @@ from typing import Callable
 import torch.utils.data
 import numpy as np
 
-
+from .mixup import FastCollateMixup
 
 def fast_collate(batch):
     """ A fast collation function optimized for uint8 images (np array or torch) and int64 targets (labels)"""
@@ -83,3 +83,15 @@ class PrefetchLoader:
     @property
     def dataset(self):
         return self.loader.dataset
+
+    @property
+    def mixup_enabled(self):
+        if isinstance(self.loader.collate_fn, FastCollateMixup):
+            return self.loader.collate_fn.mixup_enabled
+        else:
+            return False
+
+    @mixup_enabled.setter
+    def mixup_enabled(self, x):
+        if isinstance(self.loader.collate_fn, FastCollateMixup):
+            self.loader.collate_fn.mixup_enabled = x
